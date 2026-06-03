@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -47,7 +48,7 @@ func (app *App) initHttpServer() error {
 	// Legacy pudding route used by CM.
 	router.StaticFile("/bdg.yaml", saver.OutputPath+"/bdg.yaml")
 
-	router.Static("/sub/", saver.OutputPath)
+	router.GET("/sub/*filepath", serveSubFile(saver.OutputPath))
 
 	// pprof routes do not consume performance while idle.
 	pprof.Register(router)
@@ -107,6 +108,140 @@ func (app *App) initHttpServer() error {
 	}()
 	slog.Info("HTTP server started", "port", config.GlobalConfig.ListenPort)
 	return nil
+}
+
+func serveSubFile(outputPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		name := strings.TrimPrefix(c.Param("filepath"), "/")
+		name = filepath.Clean(name)
+		if name == "." || strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+
+		path := filepath.Join(outputPath, name)
+		typeQuery := c.Query("type")
+		if typeQuery == "" {
+			c.File(path)
+			return
+		}
+		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read subscription file: %v", err)})
+			return
+		}
+
+		filtered, err := filterSubscriptionByType(data, parseTypeQuery(typeQuery))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/x-yaml; charset=utf-8", filtered)
+	}
+}
+
+func parseTypeQuery(value string) map[string]struct{} {
+	types := make(map[string]struct{})
+	for _, part := range strings.Split(value, ",") {
+		t := strings.ToLower(strings.TrimSpace(part))
+		if t == "" {
+			continue
+		}
+		types[t] = struct{}{}
+		switch t {
+		case "hy2":
+			types["hysteria2"] = struct{}{}
+		case "hysteria2":
+			types["hy2"] = struct{}{}
+		case "socks":
+			types["socks5"] = struct{}{}
+		}
+	}
+	return types
+}
+
+func filterSubscriptionByType(data []byte, types map[string]struct{}) ([]byte, error) {
+	if len(types) == 0 {
+		return data, nil
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("failed to parse subscription YAML: %w", err)
+	}
+
+	proxiesRaw, ok := doc["proxies"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("subscription has no proxies list")
+	}
+
+	originalNames := make(map[string]struct{}, len(proxiesRaw))
+	filteredNames := make(map[string]struct{}, len(proxiesRaw))
+	filtered := make([]any, 0, len(proxiesRaw))
+	for _, item := range proxiesRaw {
+		proxy, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := proxy["name"].(string)
+		if name != "" {
+			originalNames[name] = struct{}{}
+		}
+		t, _ := proxy["type"].(string)
+		if _, ok := types[strings.ToLower(strings.TrimSpace(t))]; !ok {
+			continue
+		}
+		filtered = append(filtered, item)
+		if name != "" {
+			filteredNames[name] = struct{}{}
+		}
+	}
+	doc["proxies"] = filtered
+	pruneProxyGroups(doc, originalNames, filteredNames)
+
+	return yaml.Marshal(doc)
+}
+
+func pruneProxyGroups(doc map[string]any, originalNames, filteredNames map[string]struct{}) {
+	groups, ok := doc["proxy-groups"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range groups {
+		group, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		values, ok := group["proxies"].([]any)
+		if !ok {
+			continue
+		}
+		pruned := make([]any, 0, len(values))
+		for _, value := range values {
+			name, ok := value.(string)
+			if !ok {
+				pruned = append(pruned, value)
+				continue
+			}
+			if _, wasProxy := originalNames[name]; !wasProxy {
+				pruned = append(pruned, value)
+				continue
+			}
+			if _, kept := filteredNames[name]; kept {
+				pruned = append(pruned, value)
+			}
+		}
+		group["proxies"] = pruned
+	}
 }
 
 // authMiddleware is API authentication middleware.

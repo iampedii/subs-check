@@ -147,6 +147,54 @@ func installPhaseCancel(cancel context.CancelFunc) func() {
 
 var Bucket *ratelimit.Bucket
 
+var probePacer = &globalProbePacer{}
+
+type globalProbePacer struct {
+	mu   sync.Mutex
+	next time.Time
+}
+
+func resetProbePacer() {
+	probePacer.mu.Lock()
+	probePacer.next = time.Time{}
+	probePacer.mu.Unlock()
+}
+
+func reserveProbeSlot(interval time.Duration, now time.Time) time.Time {
+	probePacer.mu.Lock()
+	defer probePacer.mu.Unlock()
+
+	if probePacer.next.Before(now) {
+		probePacer.next = now
+	}
+	slot := probePacer.next
+	probePacer.next = slot.Add(interval)
+	return slot
+}
+
+func waitForProbeSlot(ctx context.Context) error {
+	intervalMS := config.GlobalConfig.ProbeIntervalMS
+	if intervalMS <= 0 {
+		return nil
+	}
+
+	now := time.Now()
+	slot := reserveProbeSlot(time.Duration(intervalMS)*time.Millisecond, now)
+	delay := slot.Sub(now)
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // effectiveConcurrency calculates the effective concurrency for a stage.
 func effectiveConcurrency(phaseConcurrency, fallback, itemCount int) int {
 	c := phaseConcurrency
@@ -191,6 +239,11 @@ func Check() ([]Result, error) {
 
 	proxies = proxyutils.DeduplicateProxies(proxies)
 	slog.Info(fmt.Sprintf("Nodes after deduplication: %d", len(proxies)))
+	if limit := config.GlobalConfig.MaxProbesPerRun; limit > 0 && len(proxies) > limit {
+		before := len(proxies)
+		proxies = limitProxiesForRun(proxies, limit, config.GlobalConfig.ShuffleTestOrder)
+		slog.Warn("Probe cap enabled; limiting node checks", "before", before, "after", len(proxies))
+	}
 
 	checker := &ProxyChecker{
 		results: make([]Result, 0),
@@ -203,6 +256,8 @@ func Check() ([]Result, error) {
 // pipeline as soon as the collector has gathered N passing items; in-flight work
 // is drained and un-dispatched items are discarded.
 func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
+	resetProbePacer()
+
 	if config.GlobalConfig.TotalSpeedLimit != 0 {
 		Bucket = ratelimit.NewBucketWithRate(float64(config.GlobalConfig.TotalSpeedLimit*1024*1024), int64(config.GlobalConfig.TotalSpeedLimit*1024*1024/10))
 	} else {
@@ -404,6 +459,27 @@ func pipelineDispatch(ctx context.Context, proxies []map[string]any, out chan<- 
 		case out <- aliveTask{idx: i, proxy: proxies[i]}:
 		}
 	}
+}
+
+func limitProxiesForRun(proxies []map[string]any, limit int, shuffle bool) []map[string]any {
+	if limit <= 0 || len(proxies) <= limit {
+		return proxies
+	}
+	if !shuffle {
+		return proxies[:limit]
+	}
+
+	order := make([]int, len(proxies))
+	for i := range order {
+		order[i] = i
+	}
+	rand.Shuffle(len(order), func(a, b int) { order[a], order[b] = order[b], order[a] })
+
+	limited := make([]map[string]any, limit)
+	for i := 0; i < limit; i++ {
+		limited[i] = proxies[order[i]]
+	}
+	return limited
 }
 
 // startAliveWorkers spawns n alive-check workers.
@@ -831,6 +907,10 @@ func CreateClient(mapping map[string]any) *ProxyClient {
 	var bytesRead uint64
 	baseTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if err := waitForProbeSlot(ctx); err != nil {
+				return nil, err
+			}
+
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err

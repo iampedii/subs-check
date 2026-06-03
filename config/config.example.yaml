@@ -8,6 +8,14 @@ media-concurrent: 20
 # Speed-test concurrency. Defaults to concurrent.
 # A lower value is recommended to avoid bandwidth contention and inaccurate results.
 speed-concurrent: 20
+# Minimum delay before each outbound proxy dial, globally across all check stages.
+# 0 disables pacing. If your provider warned you about network scans, set this
+# to 1000-3000 and reduce concurrent/media-concurrent/speed-concurrent.
+probe-interval-ms: 0
+# Maximum candidate proxy nodes to test in one run after deduplication.
+# 0 means unlimited. Use this with probe-interval-ms to avoid checking a large
+# public list in one burst.
+max-probes-per-run: 0
 # Whether to shuffle node test order. This only affects test timing; output
 # still preserves the original subscription order.
 # This can prevent adjacent provider nodes or multiple protocols of the same

@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // writeTempFile writes content to a fresh temp file and returns its path.
@@ -150,4 +152,54 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+func TestFilterSubscriptionByType(t *testing.T) {
+	data := []byte(`
+proxies:
+  - name: trojan-one
+    type: trojan
+  - name: vless-one
+    type: vless
+proxy-groups:
+  - name: auto
+    type: select
+    proxies:
+      - trojan-one
+      - vless-one
+      - DIRECT
+`)
+
+	filtered, err := filterSubscriptionByType(data, parseTypeQuery("trojan"))
+	if err != nil {
+		t.Fatalf("filterSubscriptionByType returned error: %v", err)
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(filtered, &doc); err != nil {
+		t.Fatalf("parse filtered YAML: %v", err)
+	}
+	proxies := doc["proxies"].([]any)
+	if len(proxies) != 1 {
+		t.Fatalf("expected 1 proxy, got %d", len(proxies))
+	}
+	if got := proxies[0].(map[string]any)["name"]; got != "trojan-one" {
+		t.Fatalf("proxy name = %v, want trojan-one", got)
+	}
+
+	groups := doc["proxy-groups"].([]any)
+	groupProxies := groups[0].(map[string]any)["proxies"].([]any)
+	want := []any{"trojan-one", "DIRECT"}
+	if !reflect.DeepEqual(groupProxies, want) {
+		t.Fatalf("group proxies = %v, want %v", groupProxies, want)
+	}
+}
+
+func TestParseTypeQueryIncludesAliases(t *testing.T) {
+	types := parseTypeQuery("hy2,socks")
+	for _, want := range []string{"hy2", "hysteria2", "socks", "socks5"} {
+		if _, ok := types[want]; !ok {
+			t.Fatalf("expected alias %q in parsed types: %v", want, types)
+		}
+	}
 }

@@ -7,6 +7,8 @@ type Config struct {
 	Concurrent           int       `yaml:"concurrent"`
 	SpeedConcurrent      int       `yaml:"speed-concurrent"`
 	MediaConcurrent      int       `yaml:"media-concurrent"`
+	ProbeIntervalMS      int       `yaml:"probe-interval-ms"`
+	MaxProbesPerRun      int       `yaml:"max-probes-per-run"`
 	ShuffleTestOrder     bool      `yaml:"shuffle-test-order"`
 	CheckInterval        int       `yaml:"check-interval"`
 	CronExpression       string    `yaml:"cron-expression"`
